@@ -1,0 +1,6 @@
+Original_Image,Generated_Image,Plausibility,Date
+bone_marrow_train_flat/ART_image_1.jpg,bone_marrow_generated_flat/generated_ART_image_1_0.png,Plausible,25-06-2025
+bone_marrow_train_flat/ART_image_1.jpg,bone_marrow_generated_flat/generated_ART_image_1_1.png,Plausible,25-06-2025
+bone_marrow_train_flat/ART_image_1.jpg,bone_marrow_generated_flat/generated_ART_image_1_2.png,Implausible,25-06-2025
+bone_marrow_train_flat/ART_image_1.jpg,bone_marrow_generated_flat/generated_ART_image_1_3.png,Plausible,25-06-2025
+bone_marrow_train_flat/ART_image_1.jpg,bone_marrow_generated_flat/generated_ART_image_1_4.png,Plausible,25-06-2025
