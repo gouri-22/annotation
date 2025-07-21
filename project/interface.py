@@ -7,11 +7,6 @@ import pandas as pd
 from io import StringIO
 from dotenv import load_dotenv
 import re
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -30,13 +25,11 @@ def download_csv_from_s3(s3_key):
         response = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
         csv_content = response['Body'].read().decode('utf-8')
         df = pd.read_csv(StringIO(csv_content))
-        logger.info(f"Downloaded CSV with {len(df)} rows from {s3_key}")
         return df
     except s3.exceptions.NoSuchKey:
-        logger.info(f"No CSV found at {s3_key}, returning empty DataFrame")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
     except Exception as e:
-        logger.error(f"⚠ Failed to download CSV from S3: {e}")
+        print(f"⚠ Failed to download CSV from S3: {e}")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
 
 # ------------------- Task Selector UI -------------------
@@ -66,7 +59,6 @@ def load_image_sets_from_json(task):
         return []
 
     if not os.path.exists(json_path):
-        logger.error(f"JSON file not found: {json_path}")
         st.error(f"⚠ JSON file not found: {json_path}")
         return []
 
@@ -74,7 +66,6 @@ def load_image_sets_from_json(task):
         with open(json_path, "r") as f:
             image_sets = json.load(f)
     except Exception as e:
-        logger.error(f"Failed to load image sets from {json_path}: {e}")
         st.error(f"⚠ Failed to load image sets: {e}")
         return []
 
@@ -82,7 +73,7 @@ def load_image_sets_from_json(task):
     df = download_csv_from_s3(csv_key)
 
     def extract_key(url):
-        match = re.search(r"(?:https?://[^/]+/)?(.+?)(?:\?|$)", url)  # Updated regex to handle various URL formats
+        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
         return match.group(1) if match else url
 
     # Filter out image sets where all generated images are annotated
@@ -90,22 +81,41 @@ def load_image_sets_from_json(task):
     for image_set in image_sets:
         original_key = extract_key(image_set["original"])
         generated_keys = [extract_key(url) for url in image_set["generated"]]
+
+        # Check annotations for this original image
         annotations = df[df["Original_Image"] == original_key]
         annotated_gen_keys = set(annotations["Generated_Image"].values)
-        logger.info(f"Debug: Original {original_key}, Generated {generated_keys}, Annotated {annotated_gen_keys}")
-        if len(annotated_gen_keys) < len(generated_keys):  # Include only if not fully annotated
-            filtered_image_sets.append(image_set)
-        else:
-            logger.info(f"Excluded fully annotated set for original: {original_key}")
 
-    if not filtered_image_sets:
-        st.warning("All images have been annotated for this task.")
-        return []
+        # If not all generated images are annotated, keep this set
+        # if len(annotated_gen_keys.intersection(set(generated_keys))) < len(generated_keys):
+        #     filtered_image_sets.append(image_set)
 
-    return filtered_image_sets
+    # if not filtered_image_sets:
+    #     st.warning("All images have been annotated for this task.")
+    #     return []
+
+    # return filtered_image_sets
+    return image_sets  
 
 # ------------------- Wrapper Function -------------------
 def get_image_sets():
-    """Get image sets for the selected task."""
+    """Get all image sets for the selected task."""
     task = st.session_state.get("selected_task")
-    return load_image_sets_from_json(task)
+    if task == "bone":
+        json_path = "bone_marrow_image_sets.json"
+    elif task == "derma":
+        json_path = "derma_image_sets.json"
+    else:
+        return []
+
+    if not os.path.exists(json_path):
+        st.error(f"⚠ JSON file not found: {json_path}")
+        return []
+
+    try:
+        with open(json_path, "r") as f:
+            image_sets = json.load(f)
+        return image_sets
+    except Exception as e:
+        st.error(f"⚠ Failed to load image sets: {e}")
+        return []

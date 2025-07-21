@@ -11,14 +11,10 @@ from datetime import datetime
 import boto3
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-sys.path.append("libs")
 from streamlit_image_zoom import image_zoom
+import ssl
+import urllib3
+
 try:
     from PIL import Image
 except ImportError:
@@ -26,14 +22,24 @@ except ImportError:
     Image = None
 
 sys.path.append("project")
-
 load_dotenv()
+
+# Configure urllib3 to use TLS 1.2
+urllib3.util.ssl_.DEFAULT_CIPHERS = 'DEFAULT@SECLEVEL=2'
+
+# Create a requests session with retries
+session = requests.Session()
+session.mount('https://', requests.adapters.HTTPAdapter(
+    max_retries=3,
+    pool_connections=10,
+    pool_maxsize=10
+))
 
 # -------------- Load Class Mappings ----------------
 def load_class_mappings():
     """Load class name mappings from JSON file."""
     try:
-        with open("project/class_mappings.json", "r") as f:
+        with open("class_mappings.json", "r") as f:
             return json.load(f)
     except FileNotFoundError:
         st.error("Class mappings JSON file not found.")
@@ -57,42 +63,22 @@ def get_class_name(url):
         return "Unknown"
 
 # -------------- AWS + S3 Config ----------------
-S3_INITIALIZED = False
-s3 = None
-BUCKET_NAME = None
-
-def initialize_s3():
-    """Initialize S3 client and bucket configuration."""
-    global s3, BUCKET_NAME, S3_INITIALIZED
-    logger.info("Initializing S3 client...")
-    try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.getenv("AWS_REGION"),
-        )
-        BUCKET_NAME = os.getenv("S3_BUCKET")
-        if not BUCKET_NAME:
-            logger.error("S3 bucket name not set.")
-            st.error("S3 bucket name not set.")
-            return False
-        s3.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=1)
-        logger.info("S3 initialized successfully.")
-        S3_INITIALIZED = True
-        return True
-    except Exception as e:
-        logger.error(f"Failed to initialize S3: {e}")
-        st.error(f"Failed to initialize S3: {e}")
-        BUCKET_NAME = None
-        return False
-
-# Initialize S3 at startup
-S3_INITIALIZED = initialize_s3()
+try:
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION"),
+    )
+    BUCKET_NAME = os.getenv("S3_BUCKET")
+except Exception as e:
+    st.error(f"Failed to initialize S3 client: {e}")
+    BUCKET_NAME = None
 
 def test_s3_connection():
     """Test S3 connectivity silently, only display errors."""
-    if not S3_INITIALIZED:
+    if BUCKET_NAME is None:
+        st.error("S3 bucket not configured.")
         return
     try:
         s3.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=1)
@@ -103,11 +89,12 @@ def test_s3_connection():
         st.error(f"S3 connection failed: {e}")
 
 def upload_csv_to_s3(local_path, s3_key):
-    if not S3_INITIALIZED:
+    if BUCKET_NAME is None:
+        st.error("S3 bucket not configured.")
         return
     try:
         s3.upload_file(local_path, BUCKET_NAME, s3_key)
-        logger.info(f"Uploaded {s3_key} to S3")
+        print(f"✅ Uploaded {s3_key} to S3")
     except ClientError as e:
         error_code = e.response['Error']['Code']
         st.error(f"Failed to upload CSV to S3: {error_code} - {e.response['Error']['Message']}")
@@ -116,24 +103,21 @@ def upload_csv_to_s3(local_path, s3_key):
 
 def download_csv_from_s3(s3_key):
     """Download CSV from S3 and return as a pandas DataFrame."""
-    if not S3_INITIALIZED:
+    if BUCKET_NAME is None:
+        st.error("S3 bucket not configured.")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
     try:
         response = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
         csv_content = response['Body'].read().decode('utf-8')
         df = pd.read_csv(StringIO(csv_content))
-        logger.info(f"Downloaded CSV with {len(df)} rows from {s3_key}")
         return df
     except s3.exceptions.NoSuchKey:
-        logger.info(f"No CSV found at {s3_key}, returning empty DataFrame")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
     except ClientError as e:
         error_code = e.response['Error']['Code']
-        logger.error(f"Failed to download CSV from S3: {error_code} - {e.response['Error']['Message']}")
         st.error(f"Failed to download CSV from S3: {error_code} - {e.response['Error']['Message']}")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
     except Exception as e:
-        logger.error(f"Failed to download CSV from S3: {e}")
         st.error(f"Failed to download CSV from S3: {e}")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
 
@@ -156,11 +140,6 @@ if "selections" not in st.session_state:
 if "completed_sets" not in st.session_state:
     st.session_state.completed_sets = set()
 
-# Reset current_index if S3 CSV is empty
-df = download_csv_from_s3(S3_CSV_KEY)
-if df.empty:
-    st.session_state.current_index = 0
-
 # ---------------- Load URLs ----------------
 from interface import get_image_sets
 image_sets = get_image_sets()
@@ -172,27 +151,25 @@ if st.session_state.current_index >= len(image_sets):
     st.session_state.current_index = max(0, len(image_sets) - 1)
 
 # ---------------- Image Fetching ----------------
-@st.cache_data(show_spinner=False)
 def load_image(url):
     if Image is None:
         st.error("Cannot load images: Pillow library is missing.")
         return None
     try:
-        response = requests.get(url, timeout=15)
+        response = session.get(url, timeout=15)
         response.raise_for_status()
         img = Image.open(BytesIO(response.content)).convert("RGB")
-        logger.info(f"Successfully loaded image from {url}")
         return img
+    except requests.exceptions.SSLError as e:
+        st.error(f"Failed to load image {url}: {e}")
+        return None
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to load image {url}: {e}")
         st.error(f"Failed to load image {url}: {e}")
         return None
     except NameError as e:
-        logger.error(f"Image processing error for {url}: {e}")
         st.error(f"Image processing error: {e}. Ensure Pillow is installed.")
         return None
     except Exception as e:
-        logger.error(f"Error processing image {url}: {e}")
         st.error(f"Error processing image {url}: {e}")
         return None
 
@@ -238,7 +215,6 @@ def get_total_fully_annotated():
         fully_done = counts[counts == 5]
         return len(fully_done)
     except Exception as e:
-        logger.error(f"Error counting fully annotated images: {e}")
         st.error(f"Error counting fully annotated images: {e}")
         return 0
 
@@ -277,6 +253,17 @@ def show_navigation():
             else:
                 st.warning("⚠ Please annotate all 5 generated images before proceeding.")
 
+def is_fully_annotated(original_url, generated_urls, df):
+    def extract_key(url):
+        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
+        return match.group(1) if match else url
+
+    original_key = extract_key(original_url)
+    annotations = df[df["Original_Image"] == original_key]
+    generated_keys = [extract_key(url) for url in generated_urls]
+    return len(annotations) == len(generated_keys)
+
+
 # ---------------- Render Generated Image Fragment ----------------
 @st.fragment
 def render_generated_image(index, gen_url, i, original_url, annotations_df):
@@ -304,7 +291,7 @@ def render_generated_image(index, gen_url, i, original_url, annotations_df):
             if key not in st.session_state.selections:
                 existing_annotation = annotations_df[annotations_df["Generated_Image"] == gen_key]
                 if not existing_annotation.empty:
-                    st.session_state.selections[key] = existing_annotation.iloc[0]["Plausibility"]
+                 st.session_state.selections[key] = existing_annotation.iloc[0]["Plausibility"]
 
             selected = st.session_state.selections.get(key)
 
@@ -327,6 +314,20 @@ def render_generated_image(index, gen_url, i, original_url, annotations_df):
 
 # ---------------- Main View ----------------
 def show_main_view():
+    df = download_csv_from_s3(S3_CSV_KEY)
+
+    # Skip to next unannotated image
+    while st.session_state.current_index < len(image_sets):
+        current_set = image_sets[st.session_state.current_index]
+        if not is_fully_annotated(current_set["original"], current_set["generated"], df):
+            break  # Found next unannotated
+        st.session_state.current_index += 1
+
+    # If all are annotated
+    if st.session_state.current_index >= len(image_sets):
+        st.success("🎉 All images have been annotated!")
+        st.stop()
+
     index = st.session_state.current_index
     current_set = image_sets[index]
 
@@ -359,6 +360,8 @@ def show_main_view():
 # ---------------- Run ----------------
 st.title("Image Annotation Tool")
 st.success(f"Annotated Images: {get_total_fully_annotated()}")
+st.success(f"Progress: {get_total_fully_annotated()} / {len(image_sets)} sets annotated.")
+
 
 # Test S3 connection silently at startup
 test_s3_connection()
