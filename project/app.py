@@ -39,11 +39,13 @@ session.mount('https://', requests.adapters.HTTPAdapter(
 def load_class_mappings():
     """Load class name mappings from JSON file."""
     try:
-        with open("./class_mappings.json", "r") as f:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(current_dir, "class_mappings.json")
+        with open(path, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         st.error("Class mappings JSON file not found.")
-        st.error(os.getcwd())
+        st.error(f"🔍 Tried: {path}")
         return {}
     except Exception as e:
         st.error(f"Error loading class mappings: {e}")
