@@ -43,6 +43,7 @@ def load_class_mappings():
             return json.load(f)
     except FileNotFoundError:
         st.error("Class mappings JSON file not found.")
+        st.error(os.getcwd())
         return {}
     except Exception as e:
         st.error(f"Error loading class mappings: {e}")
