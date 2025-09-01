@@ -65,6 +65,15 @@ def get_class_name(url):
         st.error(f"Error extracting class name from URL: {e}")
         return "Unknown"
 
+# -------------- URL Key Extraction Helper ----------------
+def extract_key(url: str) -> str:
+    """Extract the stable S3 key path fragment from a (possibly presigned) URL."""
+    try:
+        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
+        return match.group(1) if match else url
+    except Exception:
+        return url
+
 # -------------- AWS + S3 Config ----------------
 try:
     s3 = boto3.client(
@@ -124,6 +133,17 @@ def download_csv_from_s3(s3_key):
         st.error(f"Failed to download CSV from S3: {e}")
         return pd.DataFrame(columns=["Original_Image", "Generated_Image", "Plausibility", "Date"])
 
+# Prefer local CSV (fresh writes) and fall back to S3
+def get_annotations_df():
+    """Load annotations, preferring local CSV for immediate freshness, else S3."""
+    try:
+        if os.path.exists(CSV_FILE):
+            return pd.read_csv(CSV_FILE)
+    except Exception as e:
+        st.error(f"Failed reading local CSV: {e}")
+    # Fallback to S3
+    return download_csv_from_s3(S3_CSV_KEY)
+
 # ---------------- Streamlit Config ----------------
 st.set_page_config(page_title="Image Annotation Tool")
 
@@ -178,10 +198,6 @@ def load_image(url):
 
 # ---------------- CSV Saving ----------------
 def save_selection_to_csv(original_url, generated_url, label):
-    def extract_key(url):
-        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
-        return match.group(1) if match else url
-
     original = extract_key(original_url)
     generated = extract_key(generated_url)
 
@@ -195,8 +211,8 @@ def save_selection_to_csv(original_url, generated_url, label):
     # Ensure project directory exists
     os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
 
-    # Load existing CSV from S3
-    df = download_csv_from_s3(S3_CSV_KEY)
+    # Load existing annotations (local preferred for freshness)
+    df = get_annotations_df()
 
     # Append new data, avoiding duplicates
     new_row = pd.DataFrame([data])
@@ -207,16 +223,29 @@ def save_selection_to_csv(original_url, generated_url, label):
     # Save locally and upload to S3
     df.to_csv(CSV_FILE, index=False)
     upload_csv_to_s3(CSV_FILE, S3_CSV_KEY)
+    # Do not rerun here; only advance on explicit Next click
 
 # ---------------- Counter for Fully Annotated Originals ----------------
 def get_total_fully_annotated():
-    df = download_csv_from_s3(S3_CSV_KEY)
+    """Count how many original images are fully annotated based on actual generated counts per set."""
+    df = get_annotations_df()
     if df.empty:
         return 0
     try:
-        counts = df.groupby("Original_Image")["Generated_Image"].count()
-        fully_done = counts[counts == 5]
-        return len(fully_done)
+        # Build expected counts per original from current image_sets
+        expected = {}
+        for s in image_sets:
+            orig_key = extract_key(s["original"])
+            expected[orig_key] = len([extract_key(u) for u in s.get("generated", [])])
+
+        fully_done = 0
+        for orig_key, needed in expected.items():
+            if needed == 0:
+                continue
+            done = df[df["Original_Image"] == orig_key]["Generated_Image"].nunique()
+            if done >= needed:
+                fully_done += 1
+        return fully_done
     except Exception as e:
         st.error(f"Error counting fully annotated images: {e}")
         return 0
@@ -236,44 +265,43 @@ def show_navigation():
                 if st.session_state.current_index < 0:
                     st.session_state.current_index = 0
                 st.rerun()
-
     with col3:
         if st.button("Next"):
             index = st.session_state.current_index
             current_set = image_sets[index]
-            def extract_key(url):
-                match = re.search(r"\.com/(.+?)(?:\?|$)", url)
-                return match.group(1) if match else url
+
             original_key = extract_key(current_set["original"])
-            df = download_csv_from_s3(S3_CSV_KEY)
+            df = get_annotations_df()
             annotations = df[df["Original_Image"] == original_key]
             generated_keys = [extract_key(url) for url in current_set["generated"]]
-            if len(annotations) == len(generated_keys):
+
+            # Include any selections made in this session (not relying solely on CSV)
+            annotated_keys = set(annotations["Generated_Image"].astype(str).tolist())
+            for (sel_index, i), _label in st.session_state.selections.items():
+                if sel_index == index and i < len(current_set["generated"]):
+                    annotated_keys.add(extract_key(current_set["generated"][i]))
+
+            if len(set(generated_keys)) == len(annotated_keys.intersection(set(generated_keys))):
                 st.session_state.completed_sets.add(index)
                 if st.session_state.current_index < len(image_sets) - 1:
                     st.session_state.current_index += 1
-                st.rerun()
+                else:
+                    st.session_state.current_index = 0  # optional: loop back
+                st.rerun()   # 👈 force refresh here
             else:
-                st.warning("⚠ Please annotate all 5 generated images before proceeding.")
+                st.warning("⚠ Please annotate all generated images before proceeding.")
+
 
 def is_fully_annotated(original_url, generated_urls, df):
-    def extract_key(url):
-        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
-        return match.group(1) if match else url
-
     original_key = extract_key(original_url)
     annotations = df[df["Original_Image"] == original_key]
     generated_keys = [extract_key(url) for url in generated_urls]
-    return len(annotations) == len(generated_keys)
+    return annotations["Generated_Image"].nunique() == len(generated_keys)
 
 
 # ---------------- Render Generated Image Fragment ----------------
 @st.fragment
 def render_generated_image(index, gen_url, i, original_url, annotations_df):
-    def extract_key(url):
-        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
-        return match.group(1) if match else url
-
     fragment_key = f"gen_image_{index}_{i}"
 
     with st.container(key=fragment_key):
@@ -294,7 +322,7 @@ def render_generated_image(index, gen_url, i, original_url, annotations_df):
             if key not in st.session_state.selections:
                 existing_annotation = annotations_df[annotations_df["Generated_Image"] == gen_key]
                 if not existing_annotation.empty:
-                 st.session_state.selections[key] = existing_annotation.iloc[0]["Plausibility"]
+                    st.session_state.selections[key] = existing_annotation.iloc[0]["Plausibility"]
 
             selected = st.session_state.selections.get(key)
 
@@ -305,6 +333,7 @@ def render_generated_image(index, gen_url, i, original_url, annotations_df):
             with c1:
                 label = "✔ Plausible" if selected == "Plausible" else "Plausible"
                 plausible_key = f"p_{index}_{i}_{gen_key[:10]}"
+                
                 if st.button(label, key=plausible_key):
                     st.session_state.selections[key] = "Plausible"
                     save_selection_to_csv(original_url, gen_url, "Plausible")
@@ -317,7 +346,7 @@ def render_generated_image(index, gen_url, i, original_url, annotations_df):
 
 # ---------------- Main View ----------------
 def show_main_view():
-    df = download_csv_from_s3(S3_CSV_KEY)
+    df = get_annotations_df()
 
     # Skip to next unannotated image
     while st.session_state.current_index < len(image_sets):
@@ -334,11 +363,8 @@ def show_main_view():
     index = st.session_state.current_index
     current_set = image_sets[index]
 
-    def extract_key(url):
-        match = re.search(r"\.com/(.+?)(?:\?|$)", url)
-        return match.group(1) if match else url
     original_key = extract_key(current_set["original"])
-    df = download_csv_from_s3(S3_CSV_KEY)
+    df = get_annotations_df()
 
     st.markdown("### Original Image")
     col1, col2, col3 = st.columns([1, 4, 1])
